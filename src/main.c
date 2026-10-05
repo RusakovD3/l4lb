@@ -1,7 +1,9 @@
-#include <stdio.h>
+#include "common.h"
 
-int main()
+int main(void)
 {
-    printf("l4lb started!\n");
-    return 0;
+    int ret = EXIT_SUCCESS;
+    ret = start_server();
+
+    return ret;
 }
