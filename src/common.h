@@ -7,4 +7,5 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-int start_server(void);
+#define PORT_SRV 8080
+#define ADDR_SRV "127.0.0.1"
