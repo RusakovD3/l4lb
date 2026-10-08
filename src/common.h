@@ -1,3 +1,6 @@
+#ifndef L4LB_COMMON_H
+#define L4LB_COMMON_H
+
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -9,3 +12,5 @@
 
 #define PORT_SRV 8080
 #define ADDR_SRV "127.0.0.1"
+
+#endif

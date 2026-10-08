@@ -45,7 +45,16 @@ int main(void)
         goto exit;
     }
 
-    send(client_fd, MSG_STR, sizeof(MSG_STR), 0);
+    ssize_t n = send(client_fd, MSG_STR, sizeof(MSG_STR), 0);
+    if (n == -1)
+    {
+        perror("send");
+        ret = EXIT_FAILURE;
+    }
+    else
+    {
+        printf("Sent \'" MSG_STR "\" to %s:%d\n", ADDR_SRV, PORT_SRV);
+    }
 
 exit:
     close(client_fd);
