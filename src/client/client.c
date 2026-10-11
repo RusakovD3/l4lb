@@ -2,7 +2,7 @@
 
 
 #define MSG_STR "Message!"
-
+#define RESPONSE_BUF_LEN 1024
 
 int main(void)
 {
@@ -50,11 +50,37 @@ int main(void)
     {
         perror("send");
         ret = EXIT_FAILURE;
+        goto exit;
     }
-    else
+
+    printf("Sent \'" MSG_STR "\" to %s:%d\n", ADDR_SRV, PORT_SRV);
+
+    char buffer[RESPONSE_BUF_LEN];
+    n = recv(client_fd, buffer, sizeof(buffer), 0);
+    if (n == -1)
     {
-        printf("Sent \'" MSG_STR "\" to %s:%d\n", ADDR_SRV, PORT_SRV);
+        perror("recv");
+        ret = EXIT_FAILURE;
+        goto exit;
     }
+
+    if (n == 0)
+    {
+        fprintf(stderr, "Server closed connection without response\n");
+        ret = EXIT_FAILURE;
+        goto exit;
+    }
+
+    printf("Received %zd bytes from server: ", n);
+
+    if (fwrite(buffer, 1, (size_t) n, stdout) != (size_t)n)
+    {
+        perror("fwrite");
+        ret = EXIT_FAILURE;
+        goto exit;
+    }
+
+    putchar('\n');
 
 exit:
     close(client_fd);
