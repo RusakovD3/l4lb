@@ -325,25 +325,58 @@ static void accept_clients(int epoll_fd,
     }
 }
 
-static int read_client(struct endpoint *endpoint)
+static int forward_client_to_backend(struct connection *conn)
 {
     char buffer[BUF_LEN];
 
     for (;;)
     {
-        ssize_t n = read(endpoint->fd,
-                         buffer,
-                         sizeof(buffer));
-
+        ssize_t n = read(conn->client.fd, buffer, sizeof(buffer));
         if (n > 0)
         {
-            printf("Received from client: %.*s\n", (int)n, buffer);
+            size_t offset = 0;
+            while (offset < (size_t)n)
+            {
+                ssize_t written = send(conn->backend.fd,
+                                       buffer + offset,
+                                       (size_t)n - offset,
+                                       MSG_NOSIGNAL);
+
+                if (written > 0)
+                {
+                    offset += (size_t)written;
+                    continue;
+                }
+
+                if (written == 0)
+                {
+                    fprintf(stderr, "send: backend returned 0\n");
+                    return -1;
+                }
+
+                if (errno == EINTR)
+                    continue;
+
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    fprintf(stderr,
+                            "Backend write would block: forwarded %zu/%zd bytes\n",
+                            offset, n);
+
+                    return -1;
+                }
+
+                perror("send: backend");
+                return -1;
+            }
+
+            printf("Forwarded %zd bytes client -> backend\n", n);
             continue;
         }
 
         if (n == 0)
         {
-            printf("Client closed connection, fd=%d\n", endpoint->fd);
+            printf("Client closed connection, fd=%d\n", conn->client.fd);
             return -1;
         }
 
@@ -378,9 +411,11 @@ static void handle_connection_event(int epoll_fd,
         }
     }
 
-    if (endpoint->type == ENDPOINT_CLIENT && events & EPOLLIN)
+    if (endpoint->type == ENDPOINT_CLIENT &&
+        conn->state == CONN_READY &&
+        events & EPOLLIN)
     {
-        if (read_client(endpoint) == -1)
+        if (forward_client_to_backend(conn) == -1)
         {
             close_connection(epoll_fd, conn);
             return;
