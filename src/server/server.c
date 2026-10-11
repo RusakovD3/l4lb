@@ -6,7 +6,7 @@
 #define BACKEND_PORT 9000
 #define BACKEND_ADDR "127.0.0.1"
 
-#define BUF_LEN 1024
+#define IO_BUF_LEN 16384
 #define BACKLOG 16
 #define MAX_EVENTS 16
 
@@ -26,6 +26,14 @@ enum connection_state
 
 struct connection;
 
+struct io_buffer
+{
+    char data[IO_BUF_LEN];
+
+    size_t offset;
+    size_t length;
+};
+
 struct endpoint
 {
     int fd;
@@ -38,11 +46,160 @@ struct connection
     struct endpoint client;
     struct endpoint backend;
 
+    struct io_buffer client_to_backend;
+    struct io_buffer backend_to_client;
+
     enum connection_state state;
 
     struct connection *next;
 };
 
+static size_t buffer_pending(const struct io_buffer *buffer)
+{
+    return buffer->length - buffer->offset;
+}
+
+static int buffer_empty(const struct io_buffer *buffer)
+{
+    return buffer_pending(buffer) == 0;
+}
+
+static void buffer_reset(struct io_buffer *buffer)
+{
+    buffer->offset = 0;
+    buffer->length = 0;
+}
+
+static int flush_buffer(int fd,
+                        struct io_buffer *buffer,
+                        const char *name)
+{
+    while (!buffer_empty(buffer))
+    {
+        size_t remaining = buffer->length - buffer->offset;
+
+        ssize_t n = send(fd,
+                         buffer->data + buffer->offset,
+                         remaining,
+                         MSG_NOSIGNAL);
+
+        if (n > 0)
+        {
+            buffer->offset += (size_t)n;
+            continue;
+        }
+
+        if (n == 0)
+        {
+            fprintf(stderr, "send: %s returned 0\n", name);
+            return -1;
+        }
+
+        if (errno == EINTR)
+            continue;
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
+
+        perror(name);
+        return -1;
+    }
+
+    buffer_reset(buffer);
+    return 0;
+}
+
+static int read_into_buffer(int fd,
+                            struct io_buffer *buffer,
+                            const char *name)
+{
+    if (!buffer_empty(buffer))
+        return 0;
+
+    for (;;)
+    {
+        ssize_t n = read(fd, buffer->data, sizeof(buffer->data));
+        if (n > 0)
+        {
+            buffer->offset = 0;
+            buffer->length = (size_t)n;
+
+            return 1;
+        }
+
+        if (n == 0)
+        {
+            printf("%s closed connection, fd=%d\n", name, fd);
+            return -1;
+        }
+
+        if (errno == EINTR)
+            continue;
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
+
+        perror(name);
+        return -1;
+    }
+}
+
+static int update_ready_events(int epoll_fd, struct connection *conn)
+{
+    uint32_t client_events =
+        EPOLLRDHUP |
+        EPOLLERR |
+        EPOLLHUP;
+
+    uint32_t backend_events =
+        EPOLLRDHUP |
+        EPOLLERR |
+        EPOLLHUP;
+
+    if (buffer_empty(&conn->client_to_backend))
+        client_events |= EPOLLIN;
+
+    if (!buffer_empty(&conn->backend_to_client))
+        client_events |= EPOLLOUT;
+
+    if (buffer_empty(&conn->backend_to_client))
+        backend_events |= EPOLLIN;
+
+    if (!buffer_empty(&conn->client_to_backend))
+        backend_events |= EPOLLOUT;
+
+    struct epoll_event client_event =
+    {
+        .events = client_events,
+        .data.ptr = &conn->client
+    };
+
+    if (epoll_ctl(epoll_fd,
+                  EPOLL_CTL_MOD,
+                  conn->client.fd,
+                  &client_event) == -1)
+    {
+        perror("epoll_ctl: modify client");
+        return -1;
+    }
+
+    struct epoll_event backend_event =
+    {
+        .events = backend_events,
+        .data.ptr = &conn->backend
+    };
+
+    if (epoll_ctl(epoll_fd,
+                  EPOLL_CTL_MOD,
+                  conn->backend.fd,
+                  &backend_event) == -1)
+    {
+        perror("epoll_ctl: modify backend");
+        return -1;
+    }
+
+    return 0;
+}
 
 static void close_endpoint(int epoll_fd, struct endpoint *endpoint)
 {
@@ -260,29 +417,12 @@ static int finish_backend_connect(int epoll_fd,
         return -1;
     }
 
-    struct epoll_event event =
-    {
-        .events = EPOLLIN |
-                  EPOLLRDHUP |
-                  EPOLLERR |
-                  EPOLLHUP,
-
-        .data.ptr = &conn->backend
-    };
-
-    if (epoll_ctl(epoll_fd,
-                  EPOLL_CTL_MOD,
-                  conn->backend.fd,
-                  &event) == -1)
-    {
-        perror("epoll_ctl: backend connected");
-        return -1;
-    }
-
     conn->state = CONN_READY;
 
-    printf("Backend connected, fd=%d\n",
-           conn->backend.fd);
+    if (update_ready_events(epoll_fd, conn) == -1)
+        return -1;
+
+    printf("Backend connected, fd=%d\n", conn->backend.fd);
 
     return 0;
 }
@@ -326,137 +466,58 @@ static void accept_clients(int epoll_fd,
     }
 }
 
-static int forward_client_to_backend(struct connection *conn)
+static int handle_client_read(struct connection *conn)
 {
-    char buffer[BUF_LEN];
+    int result = read_into_buffer(conn->client.fd,
+                                  &conn->client_to_backend,
+                                  "read: client");
+    if (result <= 0)
+        return result;
 
-    for (;;)
+    if (flush_buffer(conn->backend.fd,
+                     &conn->client_to_backend,
+                     "send: backend") == -1)
     {
-        ssize_t n = read(conn->client.fd, buffer, sizeof(buffer));
-        if (n > 0)
-        {
-            size_t offset = 0;
-            while (offset < (size_t)n)
-            {
-                ssize_t written = send(conn->backend.fd,
-                                       buffer + offset,
-                                       (size_t)n - offset,
-                                       MSG_NOSIGNAL);
-
-                if (written > 0)
-                {
-                    offset += (size_t)written;
-                    continue;
-                }
-
-                if (written == 0)
-                {
-                    fprintf(stderr, "send: backend returned 0\n");
-                    return -1;
-                }
-
-                if (errno == EINTR)
-                    continue;
-
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    fprintf(stderr,
-                            "Backend write would block: forwarded %zu/%zd bytes\n",
-                            offset, n);
-
-                    return -1;
-                }
-
-                perror("send: backend");
-                return -1;
-            }
-
-            printf("Forwarded %zd bytes client -> backend\n", n);
-            continue;
-        }
-
-        if (n == 0)
-        {
-            printf("Client closed connection, fd=%d\n", conn->client.fd);
-            return -1;
-        }
-
-        if (errno == EINTR)
-            continue;
-
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return 0;
-
-        perror("read: client");
         return -1;
     }
+
+    return 0;
 }
 
-static int forward_backend_to_client(struct connection *conn)
+static int handle_backend_read(struct connection *conn)
 {
-    char buffer[BUF_LEN];
+    int result = read_into_buffer(conn->backend.fd,
+                                  &conn->backend_to_client,
+                                  "read: backend");
+    if (result <= 0)
+        return result;
 
-    for (;;)
+    if (flush_buffer(conn->client.fd,
+                     &conn->backend_to_client,
+                     "send: client") == -1)
     {
-        ssize_t n = read(conn->backend.fd, buffer, sizeof(buffer));
-        if (n > 0)
-        {
-            size_t offset = 0;
-            while (offset < (size_t) n)
-            {
-                ssize_t written = send(conn->client.fd,
-                                       buffer + offset,
-                                       (size_t) n - offset,
-                                       MSG_NOSIGNAL);
-
-                if (written > 0)
-                {
-                    offset += (size_t) written;
-                    continue;
-                }
-
-                if (written == 0)
-                {
-                    fprintf(stderr, "send: client returned 0\n");
-                    return -1;
-                }
-
-                if (errno == EINTR)
-                    continue;
-
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    fprintf(stderr,
-                            "Client write would block: forwarded %zu/%zd bytes\n",
-                            offset, n
-                    );
-
-                    return -1;
-                }
-
-                perror("send: client");
-                return -1;
-            }
-
-            printf("Forwarded %zd bytes backend -> client\n", n);
-            continue;
-        }
-
-        if (n == 0)
-        {
-            printf("Backend closed connection, fd=%d\n", conn->backend.fd);
-            return -1;
-        }
-
-        if (errno == EINTR)
-            continue;
-
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return 0;
-
-        perror("read: backend");
         return -1;
     }
+
+    return 0;
+}
+
+static int handle_backend_write(struct connection *conn)
+{
+    return flush_buffer(
+        conn->backend.fd,
+        &conn->client_to_backend,
+        "send: backend"
+    );
+}
+
+static int handle_client_write(struct connection *conn)
+{
+    return flush_buffer(
+        conn->client.fd,
+        &conn->backend_to_client,
+        "send: client"
+    );
 }
 
 static void handle_connection_event(int epoll_fd,
@@ -467,11 +528,16 @@ static void handle_connection_event(int epoll_fd,
     if (conn == NULL || conn->state == CONN_CLOSED)
         return;
 
-    if (endpoint->type == ENDPOINT_BACKEND && conn->state == CONN_CONNECTING_BACKEND)
+    if (endpoint->type == ENDPOINT_BACKEND &&
+        conn->state == CONN_CONNECTING_BACKEND)
     {
-        if (events & (EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+        if (events & (EPOLLOUT |
+                      EPOLLERR |
+                      EPOLLHUP |
+                      EPOLLRDHUP))
         {
-            if (finish_backend_connect(epoll_fd, conn) == -1)
+            if (finish_backend_connect(epoll_fd,
+                                       conn) == -1)
             {
                 close_connection(epoll_fd, conn);
                 return;
@@ -479,29 +545,57 @@ static void handle_connection_event(int epoll_fd,
         }
     }
 
-    if (endpoint->type == ENDPOINT_CLIENT &&
-        conn->state == CONN_READY &&
-        events & EPOLLIN)
+    if (conn->state != CONN_READY)
+        return;
+
+    if (endpoint->type == ENDPOINT_CLIENT && events & EPOLLIN)
     {
-        if (forward_client_to_backend(conn) == -1)
+        if (handle_client_read(conn) == -1)
         {
             close_connection(epoll_fd, conn);
             return;
         }
     }
 
-    if (endpoint->type == ENDPOINT_BACKEND &&
-        conn->state == CONN_READY &&
-        events & EPOLLIN)
+    if (endpoint->type == ENDPOINT_BACKEND && events & EPOLLIN)
     {
-        if (forward_backend_to_client(conn) == -1)
+        if (handle_backend_read(conn) == -1)
         {
             close_connection(epoll_fd, conn);
             return;
         }
     }
 
-    if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+    if (endpoint->type == ENDPOINT_CLIENT && events & EPOLLOUT)
+    {
+        if (handle_client_write(conn) == -1)
+        {
+            close_connection(epoll_fd, conn);
+            return;
+        }
+    }
+
+    if (endpoint->type == ENDPOINT_BACKEND && events & EPOLLOUT)
+    {
+        if (handle_backend_write(conn) == -1)
+        {
+            close_connection(epoll_fd, conn);
+            return;
+        }
+    }
+
+    if (conn->state == CONN_CLOSED)
+        return;
+
+    if (update_ready_events(epoll_fd, conn) == -1)
+    {
+        close_connection(epoll_fd, conn);
+        return;
+    }
+
+    if (events & (EPOLLERR |
+                  EPOLLHUP |
+                  EPOLLRDHUP))
     {
         if (endpoint->type == ENDPOINT_CLIENT)
             printf("Client disconnected, fd=%d\n", endpoint->fd);
